@@ -27,6 +27,7 @@ scans setups (compression breakout / trend pullback), and returns an institution
 - `/idea 7013` — trade ideas only (entry/SL/targets with R)
 - `/watchlist add 7013 | /watchlist rm 7013 | /watchlist show`
 - `/scan` — scans your watchlist for signals
+- `/chart` - get stock chart from internet
 
 ## Notes
 - Data: Kabutan pages are rendered once via Playwright and cached. Prices via yfinance (7013.T, etc.).
