@@ -1,4 +1,8 @@
 import os
+from dotenv import load_dotenv
+
+# Load .env from project root
+load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 DEFAULT_RISK_PCT = float(os.getenv("DEFAULT_RISK_PCT", "0.8"))
