@@ -7,7 +7,6 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("MPLCONFIGDIR", "./.mplcache")
 os.makedirs("./.mplcache", exist_ok=True)
 
-import re
 import asyncio
 import logging
 import datetime as dt
@@ -30,14 +29,15 @@ from config import TELEGRAM_BOT_TOKEN, TZ
 
 # ---- Sensei agent APIs ----
 from agent.app import run_for_code, build_ideas_for_code
-from agent.fastchart import render_chart_fast  # chart-only path (internally uses resolve())
+from agent.fastchart import render_chart_fast  # chart-only path
 from agent.ingest.tickers import resolve       # single source of truth
 
-# Levels module (updated API)
+# ---- Levels (mentor style) ----
 from agent.signal.levels import (
-    compute_levels, compute_levels_sheet,
-    render_levels_table_img, render_levels_sheet_img,
+    compute_levels_sheet,
+    render_levels_sheet_img,
     as_markdown_table,
+    LevelsConfig,
 )
 
 # ---------- Logging ----------
@@ -96,12 +96,29 @@ def _resolve_horizon(args_tail):
     return span
 
 def _drop_last_partial_bar(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop the last (potentially partial 'today') bar. Works for both tz-aware and tz-naive inputs.
+    """
     if df is None or df.empty:
         return df
-    last = pd.to_datetime(df["date"].iloc[-1])
-    if last.date() == pd.Timestamp.utcnow().date():
+
+    last_ts = pd.to_datetime(df["date"].iloc[-1], errors="coerce")
+    if pd.isna(last_ts):
+        return df
+
+    # Normalize both sides to UTC date for fair comparison
+    now_utc = pd.Timestamp.now(tz=pytz.UTC)
+
+    if last_ts.tzinfo is not None:
+        last_date_utc = last_ts.tz_convert(pytz.UTC).date()
+    else:
+        # Treat naive timestamps as already-UTC (yfinance often gives UTC-naive for daily)
+        last_date_utc = last_ts.date()
+
+    if last_date_utc == now_utc.date():
         return df.iloc[:-1] if len(df) > 1 else df
     return df
+
 
 def _label_for(market: str, yahoo_symbol: str) -> str:
     """Suffix-free label for UI/filenames."""
@@ -110,6 +127,59 @@ def _label_for(market: str, yahoo_symbol: str) -> str:
     if market == "JP":
         return yahoo_symbol.split(".", 1)[0]   # '7013.T' -> '7013', '247A.T' -> '247A'
     return yahoo_symbol                        # 'FUBO', 'BRK-B', etc.
+
+# ---- Price fetching pair (working + full history) ----
+def _fetch_prices_pair(raw_code: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      df_working : intraday-friendly history (15m/60d) for clean 4H resampling
+      df_full    : daily full history (max) for ATH and weekly swings
+    Tries agent.fastchart internals first, falls back to yfinance.
+    """
+    df_working, df_full = None, None
+
+    # Try using fastchart internal loaders (preferred: consistent symbol resolution/cache)
+    try:
+        from agent.fastchart import _fetch_yf_intraday, _fetch_yf_daily_full  # type: ignore
+        df_working = _fetch_yf_intraday(raw_code, interval="15m", period="60d")
+        df_full    = _fetch_yf_daily_full(raw_code)  # full daily history
+    except Exception as e:
+        logger.debug("fastchart internals unavailable: %r", e)
+
+    # Fallback: yfinance direct
+    if df_working is None or df_working.empty or df_full is None or df_full.empty:
+        try:
+            import yfinance as yf
+            market, symbol = resolve(raw_code)
+            ticker = yf.Ticker(symbol)
+            # Working: 15m / 60d
+            w = ticker.history(interval="15m", period="60d", auto_adjust=False)
+            if not w.empty:
+                w = w.reset_index()
+                w.rename(columns={
+                    "Datetime": "date", "Open":"o","High":"h","Low":"l","Close":"c","Volume":"v"
+                }, inplace=True)
+                df_working = w[["date","o","h","l","c","v"]].copy()
+
+            # Full: 1d / max
+            f = ticker.history(interval="1d", period="max", auto_adjust=False)
+            if not f.empty:
+                f = f.reset_index()
+                f.rename(columns={
+                    "Date": "date", "Open":"o","High":"h","Low":"l","Close":"c","Volume":"v"
+                }, inplace=True)
+                df_full = f[["date","o","h","l","c","v"]].copy()
+        except Exception as e:
+            logger.debug("yfinance fallback failed: %r", e)
+
+    if df_working is None or df_working.empty:
+        raise RuntimeError("No price data (working).")
+    if df_full is None or df_full.empty:
+        # As a very last resort, use working as full (ATH may be wrong but not fatal)
+        df_full = df_working.copy()
+
+    df_working = _drop_last_partial_bar(df_working)
+    return df_working, df_full
 
 # ==========================================================
 # /start & /ping
@@ -297,7 +367,7 @@ async def chart_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ==========================================================
 async def levels_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        return await update.message.reply_text("Usage: /levels <ticker>  (e.g., /levels 247A)")
+        return await update.message.reply_text("Usage: /levels <ticker>  (e.g., /levels FUBO)")
     raw = ctx.args[0]
     # Optional preview chart horizon (defaults to 15m:5d)
     horizon = _resolve_horizon(ctx.args[1:]) if len(ctx.args) > 1 else "15m:5d"
@@ -310,36 +380,56 @@ async def levels_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.info("Levels requested for %s (%s) by %s", label, horizon, update.effective_user.id)
 
     try:
-        # Prefer dense intraday for best 4H resampling; fallback to EOD
-        df = None
-        try:
-            # private, but fine in-process for now
-            from agent.fastchart import _fetch_yf_intraday  # type: ignore
-            df = _fetch_yf_intraday(raw, interval="15m", period="60d")
-            df = _drop_last_partial_bar(df)
-        except Exception:
-            # fallback: let fastchart’s EOD cache loader do the heavy lifting
-            from agent.fastchart import _get_prices_cached  # type: ignore
-            df = _get_prices_cached(raw)
+        # Working + Full history pair (for ATH & weekly swings)
+        loop = asyncio.get_running_loop()
+        df_working, df_full = await loop.run_in_executor(None, lambda: _fetch_prices_pair(raw))
 
-        if df is None or df.empty:
-            return await update.message.reply_text(f"No price data for {label}.")
+      
+        # Compute mentor-style sheet
+        cfg = LevelsConfig(
+            # --- Weekly: use full candle range (mentor-style current wick) ---
+            range_mode_W="current",
+            smooth_bars_W=3,           # optional gentle smoothing on mid
 
-        # Compute + send markdown table
-        lv = compute_levels(df)
-        md = as_markdown_table(lv)
-        await update.message.reply_markdown(md)
+            # --- Daily: use body-smoothed to mimic prior session freeze ---
+            range_mode_D="body",
+            smooth_bars_D=2,           # average last 2 bodies (reduces daily noise)
 
-        # Render dark table image (auto out path inside module)
-        img_path = render_levels_table_img(lv, title=label)
+            # --- 4H: mentor-style Donchian (micro-range over last 4 x 4H bars) ---
+            h4_mode="donchian",        # freeze-style window
+            donchian_bars_H4=4,        # ~16 hours lookback = 1 trading day
+
+            # --- 30m: live intraday snapshot ---
+            range_mode_M30="current",
+            smooth_bars_M30=1,
+
+            # --- Include intraday 30m in sheet ---
+            include_m30=True,
+
+            # --- Optional: use mentor’s anchored ATH if df_full not provided ---
+            ath_override=8.75
+ 
+             )
+        cfg.h4_bias_when_matches_weekly = True
+        cfg.h4_bias_compress = 0.25         # try 0.30–0.40 for stronger separation
+        cfg.h4_bias_eps_ratio = 0.02  
+
+
+        levels = compute_levels_sheet(df_working, df_full=df_full, cfg=cfg, symbol=label)
+
+
+        # Send Markdown table
+        # md = as_markdown_table(levels)
+        # await update.message.reply_markdown(md)
+
+        # Render dark image and send
+        img_path = render_levels_sheet_img(levels, title=label)
         if img_path and os.path.exists(img_path):
             with open(img_path, "rb") as f:
                 await ctx.bot.send_photo(chat_id=update.effective_chat.id, photo=f)
 
         # Optional preview chart
-        chart_path = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: render_chart_fast(raw, horizon)
-        )
+        chart_path = await loop.run_in_executor(None, lambda: render_chart_fast(raw, horizon))
         if chart_path and os.path.exists(chart_path):
             with open(chart_path, "rb") as f:
                 await update.message.reply_photo(f)
@@ -362,7 +452,7 @@ async def watchlist_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Watchlist: " + ", ".join(wl) if wl else "Empty.")
 
     if len(ctx.args) < 2:
-        return await update.message.reply_text("Provide a code (e.g., 7013 or 247A).")
+        return await update.message.reply_text("Provide a code (e.g., 7013 or FUBO).")
 
     code = ctx.args[1].strip().upper()
     if action == "add":
