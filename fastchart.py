@@ -2,13 +2,11 @@
 # Minimal, fast, fail-safe chart pipeline for /chart. No fundamentals/news.
 
 from __future__ import annotations
-import os, io, time
+import os, io, time, re
 from typing import Tuple
+from datetime import timedelta
 import pandas as pd
 import numpy as np
-import re
-from datetime import timedelta
-
 
 # -------- matplotlib speed hygiene (must be before pyplot import) --------
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -28,19 +26,20 @@ _PRICE_CACHE: dict[str, Tuple[float, pd.DataFrame]] = {}
 
 # -------- tiny HTTP helper using your pooled session --------
 try:
-    from agent.ingest.http import get  # your improved session with timeouts
+    # NOTE: your helper is in https.py (not http.py)
+    from agent.ingest.https import get  # pooled session with timeouts
 except Exception:
     import requests
+
+    def get(url, **kw):  # fallback direct GET with timeout
+        kw.setdefault("timeout", (3, 5))
+        return requests.get(url, **kw)
 
 
 class DataUnavailable(Exception):
     """Raised when no price source returns data for the given code."""
 
     pass
-
-    def get(url, **kw):  # fallback direct GET with timeout
-        kw.setdefault("timeout", (3, 5))
-        return requests.get(url, **kw)
 
 
 def _fetch_stooq_prices(code: str) -> pd.DataFrame:
@@ -107,19 +106,71 @@ def _fetch_internal_yahoojp(code: str) -> pd.DataFrame:
     return df
 
 
-def _fetch_yfinance_prices(code: str) -> pd.DataFrame:
-    """Fallback via yfinance (.T)."""
+def _fetch_yf_intraday(
+    code: str, interval: str = "5m", period: str = "5d"
+) -> pd.DataFrame:
+    """
+    interval: '1m','2m','5m','15m','30m','60m','90m'
+    period:   '1d','5d','7d','14d','30d','60d'
+    NOTE: Do NOT pass a custom session to yfinance.
+    """
     try:
-        import yfinance as yf, requests
+        import yfinance as yf
+        from yfinance.exceptions import YFDataException
     except Exception as e:
         raise RuntimeError("yfinance unavailable") from e
 
-    sess = requests.Session()
-    sess.headers.update({"User-Agent": "Mozilla/5.0"})
-    tkr = yf.Ticker(f"{str(code).zfill(4)}.T", session=sess)
-    df = tkr.history(period="10y", auto_adjust=False, timeout=4)
+    symbol = f"{str(code).zfill(4)}.T"
+
+    try:
+        tkr = yf.Ticker(symbol)  # IMPORTANT: no session=...
+        df = tkr.history(period=period, interval=interval, auto_adjust=False)
+    except YFDataException as e:
+        raise RuntimeError(f"yfinance intraday error: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"yfinance intraday fetch failed: {e}") from e
+
     if df is None or df.empty:
-        raise RuntimeError("yfinance empty")
+        raise RuntimeError(
+            f"yfinance intraday empty ({interval}/{period}) for {symbol}"
+        )
+
+    df = df.reset_index().rename(
+        columns={
+            "Datetime": "date",
+            "Date": "date",
+            "Open": "o",
+            "High": "h",
+            "Low": "l",
+            "Close": "c",
+            "Volume": "v",
+        }
+    )
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df[["date", "o", "h", "l", "c", "v"]].dropna()
+    return df
+
+
+def _fetch_yfinance_prices(code: str) -> pd.DataFrame:
+    """Fallback via yfinance (.T) — no external session."""
+    try:
+        import yfinance as yf
+        from yfinance.exceptions import YFDataException
+    except Exception as e:
+        raise RuntimeError("yfinance unavailable") from e
+
+    symbol = f"{str(code).zfill(4)}.T"
+
+    try:
+        tkr = yf.Ticker(symbol)  # IMPORTANT: no session=...
+        df = tkr.history(period="10y", auto_adjust=False)
+    except YFDataException as e:
+        raise RuntimeError(f"yfinance EOD error: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"yfinance EOD fetch failed: {e}") from e
+
+    if df is None or df.empty:
+        raise RuntimeError(f"yfinance empty for {symbol}")
 
     df = df.reset_index().rename(
         columns={
@@ -133,8 +184,6 @@ def _fetch_yfinance_prices(code: str) -> pd.DataFrame:
     )
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df[["date", "o", "h", "l", "c", "v"]].dropna()
-    if df.empty:
-        raise RuntimeError("yfinance cleaned to empty")
     return df
 
 
@@ -165,11 +214,36 @@ def _get_prices_cached(code: str) -> pd.DataFrame:
     ) from last_err
 
 
+_INTRADAY_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "90m"}
+
+
+def _parse_intraday(horizon: str) -> tuple[bool, str, str]:
+    """
+    Returns (is_intraday, interval, period)
+    Accepts '5m' or '5m:10d' (interval:period). Defaults: 5m:5d.
+    """
+    if not horizon:
+        return (False, "", "")
+    h = horizon.strip().lower()
+    # form '5m' or '5m:Xd'
+    if ":" in h:
+        interval, period = h.split(":", 1)
+        interval, period = interval.strip(), period.strip()
+    else:
+        interval, period = h, "5d"
+    if interval in _INTRADAY_INTERVALS:
+        # sanitize period
+        if not re.fullmatch(r"\d+\s*[dhw]$", period):
+            period = "5d"
+        return (True, interval, period)
+    return (False, "", "")
+
+
 def _window_df(px: pd.DataFrame, horizon: str) -> pd.DataFrame:
     horizon = (horizon or "14d").lower().strip()
     df = px.copy().sort_values("date").reset_index(drop=True)
 
-    # --- weekly mode via classic suffix 'W' on month/year spans (e.g. '2yW') ---
+    # weekly mode only for classic spans like '2yW'
     weekly_flag = horizon.endswith("w") and horizon[:-1] in {
         "6m",
         "1y",
@@ -182,11 +256,10 @@ def _window_df(px: pd.DataFrame, horizon: str) -> pd.DataFrame:
     # Classic month/year presets (trading-day approximations)
     rows_map = {"6m": 130, "1y": 260, "2y": 520, "5y": 1300, "10y": 2600}
 
-    # New: 'Xd' (days) and 'Xwk' (weeks) daily windows
+    # New: 'Xd' (days) and 'Xw'/'Xwk' (weeks) daily windows
     m_days = re.fullmatch(r"(\d+)\s*d", span)
-    m_wks = re.fullmatch(r"(\d+)\s*wk", span)
+    m_wks = re.fullmatch(r"(\d+)\s*w(k)?", span)  # accept '2w' or '2wk'
 
-    # Minimum rows we want for indicators/EMAs to look okay
     MIN_ROWS = 30
 
     if weekly_flag:
@@ -200,13 +273,10 @@ def _window_df(px: pd.DataFrame, horizon: str) -> pd.DataFrame:
         rows = rows_map.get(span, 260)
         return dfw.tail(max(10, rows)).copy()
 
-    # Daily path
     if m_days:
         ndays = int(m_days.group(1))
-        # Approximate trading bars: ~5/7 of calendar days, with a little headroom
         approx_rows = int(ndays * 5 / 7 * 1.2)
         need_rows = max(MIN_ROWS, approx_rows)
-        # Prefer a calendar cutoff, but ensure we meet MIN_ROWS via tail fallback
         cutoff = df["date"].max() - timedelta(days=ndays)
         view = df[df["date"] >= cutoff]
         if len(view) < need_rows:
@@ -215,7 +285,7 @@ def _window_df(px: pd.DataFrame, horizon: str) -> pd.DataFrame:
 
     if m_wks:
         nw = int(m_wks.group(1))
-        approx_rows = int(nw * 5 * 1.2)  # ~5 trading days per week
+        approx_rows = int(nw * 5 * 1.2)
         need_rows = max(MIN_ROWS, approx_rows)
         cutoff = df["date"].max() - timedelta(days=7 * nw)
         view = df[df["date"] >= cutoff]
@@ -223,7 +293,6 @@ def _window_df(px: pd.DataFrame, horizon: str) -> pd.DataFrame:
             view = df.tail(need_rows)
         return view.copy()
 
-    # Classic month/year spans (daily)
     rows = rows_map.get(span, 260)
     return df.tail(max(MIN_ROWS, rows)).copy()
 
@@ -234,13 +303,15 @@ def _render_fast_candles(
     """
     TradingView-style renderer (tight spacing):
       • Auto width scales with candle count (fits data)
-      • Wider candle/volume bodies (smaller gaps)
-      • EMA ribbon + simple S/R + colored volume
-      • Balanced spacing so x-labels don't collide with volume bars
-    Env vars:
+      • EMA(5/25/75/200) + simple S/R + colored volume
+      • Intraday charts show HH:MM (or MM-DD HH:MM if multi-day)
+      • Daily charts show YYYY-MM-DD
+    Tunables (env):
       FASTCHART_THEME=tv-dark|tv-light
       FASTCHART_DPI, FASTCHART_FIG_H
       FASTCHART_BAR_PX, FASTCHART_MIN_W, FASTCHART_MAX_W, FASTCHART_SIDE_PX
+      FASTCHART_TZ (default Asia/Tokyo)
+      FASTCHART_EMA_LW (default 1.0), FASTCHART_EMA_ALPHA (default 0.85)
     """
     if df is None or df.empty or len(df) < 20:
         raise RuntimeError("not enough data to render")
@@ -286,12 +357,16 @@ def _render_fast_candles(
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["date", "o", "h", "l", "c"]).reset_index(drop=True)
 
-    # EMAs
-    emas = [8, 21, 34, 50, 100, 200]
+    # --- EMAs (swing-focused) ---
+    weekly_flag = horizon.lower().endswith("w")
+    emas = [5, 25, 75, 200]
     for e in emas:
         df[f"ema{e}"] = df["c"].ewm(span=e, adjust=False).mean()
+    ema_colors = {5: "#ff9800", 25: "#f06292", 75: "#4caf50", 200: "#9575cd"}
+    EMA_LW = float(os.getenv("FASTCHART_EMA_LW", "1.0"))
+    EMA_ALPHA = float(os.getenv("FASTCHART_EMA_ALPHA", "0.85"))
 
-    # Trend text
+    # stacking status
     last = df.iloc[-1]
     bull = all(last[f"ema{a}"] > last[f"ema{b}"] for a, b in zip(emas, emas[1:]))
     bear = all(last[f"ema{a}"] < last[f"ema{b}"] for a, b in zip(emas, emas[1:]))
@@ -312,19 +387,18 @@ def _render_fast_candles(
     # ---------- Auto-fit figure size (tighter defaults) ----------
     FIG_DPI = int(os.getenv("FASTCHART_DPI", "140"))
     FIG_H = float(os.getenv("FASTCHART_FIG_H", "6"))
-    BAR_PX = float(os.getenv("FASTCHART_BAR_PX", "5"))  # tighter than 7
-    MIN_W = float(os.getenv("FASTCHART_MIN_W", "8.0"))  # allow slightly smaller
+    BAR_PX = float(os.getenv("FASTCHART_BAR_PX", "5"))
+    MIN_W = float(os.getenv("FASTCHART_MIN_W", "8.0"))
     MAX_W = float(os.getenv("FASTCHART_MAX_W", "16"))
-    SIDE_PX = float(os.getenv("FASTCHART_SIDE_PX", "120"))  # smaller side margin
+    SIDE_PX = float(os.getenv("FASTCHART_SIDE_PX", "120"))
 
     n = len(df)
     fig_w = (n * BAR_PX + SIDE_PX) / FIG_DPI
     fig_w = max(MIN_W, min(MAX_W, fig_w))
 
     os.makedirs(out_dir, exist_ok=True)
-    weekly = horizon.lower().endswith("w")
     out_path = os.path.join(
-        out_dir, f"{code}_{'weekly' if weekly else 'daily'}_swing.png"
+        out_dir, f"{code}_{'weekly' if weekly_flag else 'daily'}_swing.png"
     )
 
     plt.rcParams["font.family"] = "DejaVu Sans"
@@ -333,7 +407,7 @@ def _render_fast_candles(
     ax = fig.add_subplot(gs[0])
     axv = fig.add_subplot(gs[1], sharex=ax)
 
-    # Panel backgrounds + grid/spines/ticks
+    # panels + grid/spines/ticks
     for a in (ax, axv):
         a.set_facecolor(th["panel"])
         a.grid(True, color=th["grid"], alpha=th["grid_a"], linewidth=th["grid_w"])
@@ -345,7 +419,7 @@ def _render_fast_candles(
         a.yaxis.tick_right()
         a.yaxis.set_label_position("right")
 
-    # ---------- Candles (wider bodies → smaller gaps) ----------
+    # ---------- Candles ----------
     x = np.arange(n)
     o = df["o"].values
     h = df["h"].values
@@ -354,14 +428,14 @@ def _render_fast_candles(
     v = df["v"].values
     up = c >= o
 
-    # Wicks
+    # wicks
     segs = np.stack([np.column_stack([x, l]), np.column_stack([x, h])], axis=1)
     lc = LineCollection(
         segs, colors=np.where(up, th["up"], th["down"]).tolist(), linewidths=1.0
     )
     ax.add_collection(lc)
 
-    # Wider bodies; scale a bit with n so very long windows don't overfill
+    # wider bodies; scale with n
     if n >= 260:
         body_w = 0.68
     elif n >= 160:
@@ -369,7 +443,7 @@ def _render_fast_candles(
     elif n >= 100:
         body_w = 0.78
     else:
-        body_w = 0.84  # short windows = chunkier candles
+        body_w = 0.84
 
     ax.bar(
         x[up],
@@ -391,22 +465,21 @@ def _render_fast_candles(
     )
 
     # EMAs
-    ema_colors = {
-        8: "#ff9800",
-        21: "#f06292",
-        34: "#ffcc80",
-        50: "#4caf50",
-        100: "#42a5f5",
-        200: "#9575cd",
-    }
     for e in emas:
-        ax.plot(x, df[f"ema{e}"].values, lw=1.5, color=ema_colors[e], alpha=0.95)
+        ax.plot(
+            x,
+            df[f"ema{e}"].values,
+            lw=EMA_LW,
+            alpha=EMA_ALPHA,
+            color=ema_colors[e],
+            solid_capstyle="round",
+        )
 
     # S/R
     ax.axhline(res, ls="--", lw=1.2, color=th["sr_dn"], alpha=0.9)
     ax.axhline(sup, ls="--", lw=1.2, color=th["sr_up"], alpha=0.9)
 
-    # Titles / labels
+    # title/labels
     ax.set_title(
         f"{code} Chart — {trend_txt} — {align_txt}",
         fontweight="bold",
@@ -415,28 +488,57 @@ def _render_fast_candles(
     )
     ax.set_ylabel("Price", rotation=270, labelpad=16, color=th["label"])
 
-    # ---------- Volume (match candle width; slightly wider) ----------
+    # ---------- Volume ----------
     vol_w = min(0.95, body_w + 0.06)
     axv.bar(x, v, color=np.where(up, th["up"], th["down"]), width=vol_w, align="center")
     axv.set_ylabel("Vol", rotation=270, labelpad=18, color=th["label"])
     axv.yaxis.set_major_formatter(EngFormatter())
     axv.set_ylim(0, v.max() * 1.15)
 
-    # ---------- X ticks (dates) ----------
-    ticks = 6 if n >= 120 else (5 if n >= 60 else 4)
+    # ---------- X ticks (intraday shows time) ----------
+    # We rely on your helper that detects intraday horizons.
+    is_intraday, interval, period = _parse_intraday(horizon)
+    ticks = 8 if is_intraday else (6 if n >= 120 else (5 if n >= 60 else 4))
     locs = np.linspace(0, n - 1, ticks, dtype=int)
     axv.set_xticks(locs)
-    axv.set_xticklabels(
-        [df["date"].dt.strftime("%Y-%m-%d").iloc[i] for i in locs],
-        rotation=30,
-        ha="right",
-        color=th["tick"],
-    )
+
+    # timezone for display (default JST)
+    TZNAME = os.getenv("FASTCHART_TZ", "Asia/Tokyo")
+    try:
+        import pytz
+
+        tz = pytz.timezone(TZNAME)
+    except Exception:
+        tz = None
+
+    s = df["date"]
+    if tz is not None:
+        try:
+            if s.dt.tz is None:
+                s_disp = s.dt.tz_localize("UTC").dt.tz_convert(tz)
+            else:
+                s_disp = s.dt.tz_convert(tz)
+        except Exception:
+            s_disp = s
+    else:
+        s_disp = s
+
+    if is_intraday:
+        same_day = s_disp.dt.date.nunique() == 1
+        fmt = "%H:%M" if same_day else "%m-%d %H:%M"
+    else:
+        fmt = "%Y-%m-%d"
+
+    labels = [s_disp.dt.strftime(fmt).iloc[i] for i in locs]
+    axv.set_xticklabels(labels, rotation=30, ha="right", color=th["tick"])
     axv.tick_params(axis="x", pad=12, length=0)
     fig.subplots_adjust(bottom=0.16)
 
-    # Save
-    fig.savefig(out_path, dpi=FIG_DPI, bbox_inches="tight", facecolor=th["bg"])
+    # save
+    os.makedirs(out_dir, exist_ok=True)
+    fig.savefig(
+        out_dir and out_path, dpi=FIG_DPI, bbox_inches="tight", facecolor=th["bg"]
+    )
     plt.close(fig)
 
     if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
@@ -445,23 +547,38 @@ def _render_fast_candles(
 
 
 # -------- public API --------
-def render_chart_fast(code: str, horizon: str = "2w") -> str:
+def render_chart_fast(code: str, horizon: str = "14d") -> str:
     """
-    Ultra-fast chart path used by /chart.
-    - Stooq EOD prices with hard timeout
-    - 5min TTL cache
-    - fast candlestick renderer
+    Ultra-fast chart path.
+      - Daily/EOD: cached multi-source fetch, then horizon windowing
+      - Intraday (e.g., '5m' or '15m:30d'): yfinance intraday fetch (no windowing)
     """
-    # timings (quick visibility)
     t0 = time.perf_counter()
-    px = _get_prices_cached(code)  # cached fetch
+
+    # Detect intraday horizon (expects _parse_intraday to exist)
+    is_intra, interval, period = _parse_intraday(horizon)
+
+    # --- Fetch ---
+    if is_intra:
+        px = _fetch_yf_intraday(code, interval=interval, period=period)
+    else:
+        px = _get_prices_cached(code)
+
     t1 = time.perf_counter()
-    view = _window_df(px, horizon)  # trim/resample
+
+    # --- Window / View ---
+    view = px.copy() if is_intra else _window_df(px, horizon)
+
     t2 = time.perf_counter()
+
+    # --- Render ---
     path = _render_fast_candles(str(code).zfill(4), view, horizon)
+
     t3 = time.perf_counter()
     print(
-        f"[FAST-CHART] {code} ms: fetch={(t1-t0)*1000:.0f} window={(t2-t1)*1000:.0f} render={(t3-t2)*1000:.0f} total={(t3-t0)*1000:.0f}"
+        f"[FAST-CHART] {code} ms: fetch={(t1-t0)*1000:.0f} "
+        f"window={(t2-t1)*1000:.0f} render={(t3-t2)*1000:.0f} total={(t3-t0)*1000:.0f} "
+        f"{'(intra ' + interval + ':' + period + ')' if is_intra else '(daily)'}"
     )
     return path
 
@@ -471,5 +588,5 @@ if __name__ == "__main__":
     import sys
 
     c = (sys.argv[1] if len(sys.argv) > 1 else "7013").zfill(4)
-    h = sys.argv[2] if len(sys.argv) > 2 else "1y"
+    h = sys.argv[2] if len(sys.argv) > 2 else "14d"
     print(render_chart_fast(c, h))
